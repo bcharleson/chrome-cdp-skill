@@ -67,15 +67,17 @@ function detectBrowserFromArgs(rawArgs) {
   return { browser, useDefaultProfile, args: filteredArgs };
 }
 
-function pagesCachePath(browser) {
-  return resolve(RUNTIME_DIR, `pages-${browser}.json`);
+function pagesCachePath(browser, useDefaultProfile = false) {
+  const suffix = useDefaultProfile ? `${browser}-default` : browser;
+  return resolve(RUNTIME_DIR, `pages-${suffix}.json`);
 }
 const LEGACY_PAGES_CACHE = resolve(RUNTIME_DIR, 'pages.json');
 
-function browserSockPath(browser) {
+function browserSockPath(browser, useDefaultProfile = false) {
+  const suffix = useDefaultProfile ? `${browser}-default` : browser;
   return IS_WINDOWS
-    ? `\\\\.\\pipe\\cdp-browser-${browser}`
-    : resolve(RUNTIME_DIR, `cdp-browser-${browser}.sock`);
+    ? `\\\\.\\pipe\\cdp-browser-${suffix}`
+    : resolve(RUNTIME_DIR, `cdp-browser-${suffix}.sock`);
 }
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -211,9 +213,9 @@ function getDefaultProfileWsUrl(browser = 'chrome') {
   const candidates = [
     process.env.CDP_PORT_FILE,
     ...(IS_WINDOWS ? winDirs.flatMap(b => [
-      resolve(baseLocal, b, 'CDP-Profile/DevToolsActivePort'),
       resolve(baseLocal, b, 'User Data/DevToolsActivePort'),
       resolve(baseLocal, b, 'User Data/Default/DevToolsActivePort'),
+      resolve(baseLocal, b, 'CDP-Profile/DevToolsActivePort'),
     ]) : []),
     ...macDirs.flatMap(b => [
       resolve(home, 'Library/Application Support', b, 'DevToolsActivePort'),
@@ -660,7 +662,7 @@ async function evalRawStr(cdp, sid, method, paramsJson) {
 // ---------------------------------------------------------------------------
 
 async function runBrowserDaemon(browser = 'chrome', useDefaultProfile = false) {
-  const sp = browserSockPath(browser);
+  const sp = browserSockPath(browser, useDefaultProfile);
 
   const cdp = new CDP();
   try {
@@ -865,7 +867,7 @@ function connectToSocket(sp) {
 }
 
 async function getOrStartBrowserDaemon(browser = 'chrome', useDefaultProfile = false) {
-  const sp = browserSockPath(browser);
+  const sp = browserSockPath(browser, useDefaultProfile);
   // 1. Reuse existing persistent browser daemon if running
   try { return await connectToSocket(sp); } catch {}
 
