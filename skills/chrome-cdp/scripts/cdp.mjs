@@ -1,22 +1,32 @@
 #!/usr/bin/env node
-// cdp - lightweight Chrome DevTools Protocol CLI
+// cdp - lightweight Chrome & Edge DevTools Protocol CLI
 // Uses raw CDP over WebSocket, no Puppeteer dependency.
 // Requires Node 22+ (built-in WebSocket).
 //
-// Per-tab persistent daemon: page commands go through a daemon that holds
-// the CDP session open. Chrome's "Allow debugging" modal fires once per
-// daemon (= once per tab). Daemons auto-exit after 20min idle.
+// Zero-Prompt Persistent Browser Multiplexer Architecture:
+// 1. Dedicated CDP Profile Mode (Default on Windows):
+//    Connects to (or auto-launches) Chrome (port 9224) or Edge (port 9223) with
+//    `--remote-debugging-port` and `--user-data-dir=<LOCALAPPDATA>/.../CDP-Profile`.
+//    This inherits all Windows OS CAC smartcard certificates, Windows Hello passkeys,
+//    and HKLM Group Policies (Menlo PAC proxy, DoD Root CAs) while NEVER showing
+//    an "Allow debugging?" modal prompt!
+// 2. Default Profile Mode (`--default-profile` or `CDP_DEFAULT_PROFILE=1`):
+//    Uses `DevToolsActivePort` from `chrome://inspect/#remote-debugging` with a
+//    single persistent browser multiplexer daemon (`\\.\pipe\cdp-browser-*`) so
+//    "Allow debugging?" only fires once per 24h session.
 
 import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync } from 'fs';
 import { homedir } from 'os';
 import { resolve } from 'path';
-import { spawn } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
 import net from 'net';
 
-const TIMEOUT = 15000;
+const TIMEOUT = 25000;
+const CONNECT_TIMEOUT = 45000;
 const NAVIGATION_TIMEOUT = 30000;
-const IDLE_TIMEOUT = 20 * 60 * 1000;
-const DAEMON_CONNECT_RETRIES = 20;
+const IDLE_TIMEOUT = 24 * 60 * 60 * 1000; // 24 hours
+const KEEPALIVE_INTERVAL = 4 * 60 * 1000; // 4 minutes
+const DAEMON_CONNECT_RETRIES = 150;       // 45s max wait
 const DAEMON_CONNECT_DELAY = 300;
 const MIN_TARGET_PREFIX_LEN = 8;
 const IS_WINDOWS = process.platform === 'win32';
@@ -27,27 +37,164 @@ const RUNTIME_DIR = IS_WINDOWS
     ? resolve(process.env.XDG_RUNTIME_DIR, 'cdp')
     : resolve(homedir(), '.cache', 'cdp');
 try { mkdirSync(RUNTIME_DIR, { recursive: true, mode: 0o700 }); } catch {}
-const PAGES_CACHE = resolve(RUNTIME_DIR, 'pages.json');
 
-function sockPath(targetId) {
-  return IS_WINDOWS
-    ? `\\\\.\\pipe\\cdp-${targetId}`
-    : resolve(RUNTIME_DIR, `cdp-${targetId}.sock`);
+const DEFAULT_PORTS = {
+  chrome: parseInt(process.env.CDP_CHROME_PORT || '9224', 10),
+  edge: parseInt(process.env.CDP_EDGE_PORT || '9223', 10),
+  brave: parseInt(process.env.CDP_BRAVE_PORT || '9225', 10),
+};
+
+function detectBrowserFromArgs(rawArgs) {
+  const scriptPath = (process.argv[1] || '').toLowerCase();
+  let browser = (process.env.CDP_BROWSER || (scriptPath.includes('edge-cdp') ? 'edge' : 'chrome')).toLowerCase();
+  let useDefaultProfile = process.env.CDP_DEFAULT_PROFILE === '1' || process.env.CDP_DEFAULT_PROFILE === 'true';
+  const filteredArgs = [];
+  for (let i = 0; i < rawArgs.length; i++) {
+    const a = rawArgs[i];
+    if ((a === '--browser' || a === '-b') && rawArgs[i + 1]) {
+      browser = rawArgs[++i].toLowerCase();
+    } else if (a.startsWith('--browser=')) {
+      browser = a.slice('--browser='.length).toLowerCase();
+    } else if (a === '--default-profile') {
+      useDefaultProfile = true;
+    } else {
+      filteredArgs.push(a);
+    }
+  }
+  if (browser.includes('edge') || browser === 'msedge') browser = 'edge';
+  else if (browser.includes('brave')) browser = 'brave';
+  else browser = 'chrome';
+  return { browser, useDefaultProfile, args: filteredArgs };
 }
 
-function getWsUrl() {
+function pagesCachePath(browser) {
+  return resolve(RUNTIME_DIR, `pages-${browser}.json`);
+}
+const LEGACY_PAGES_CACHE = resolve(RUNTIME_DIR, 'pages.json');
+
+function browserSockPath(browser) {
+  return IS_WINDOWS
+    ? `\\\\.\\pipe\\cdp-browser-${browser}`
+    : resolve(RUNTIME_DIR, `cdp-browser-${browser}.sock`);
+}
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+function spawnDetached(exe, args, env = process.env) {
+  if (IS_WINDOWS) {
+    // Launch synchronously via WMI Win32_Process.Create so the background daemon /
+    // browser is created by WmiPrvSE.exe completely outside any parent shell Job Object.
+    const cmdLine = [exe, ...args]
+      .map(a => (/\s/.test(String(a)) ? `"${String(a).replace(/"/g, '\\"')}"` : String(a)))
+      .join(' ');
+    const escapedForPs = cmdLine.replace(/'/g, "''");
+    spawnSync('powershell.exe', [
+      '-NoProfile',
+      '-NonInteractive',
+      '-WindowStyle', 'Hidden',
+      '-Command',
+      `$si = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0 }; Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = '${escapedForPs}'; ProcessStartupInformation = $si } | Out-Null`,
+    ], { stdio: 'ignore', windowsHide: true, env });
+    return;
+  }
+  const child = spawn(exe, args, { detached: true, stdio: 'ignore', env });
+  child.unref();
+}
+
+function findBrowserExecutable(browser = 'chrome') {
+  if (!IS_WINDOWS) return null;
+  const pf = process.env['ProgramFiles'] || 'C:\\Program Files';
+  const pf86 = process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)';
+  const local = process.env.LOCALAPPDATA || resolve(homedir(), 'AppData', 'Local');
+  const candidates = browser === 'edge'
+    ? [
+        resolve(pf86, 'Microsoft/Edge/Application/msedge.exe'),
+        resolve(pf, 'Microsoft/Edge/Application/msedge.exe'),
+        resolve(local, 'Microsoft/Edge/Application/msedge.exe'),
+      ]
+    : [
+        resolve(pf, 'Google/Chrome/Application/chrome.exe'),
+        resolve(pf86, 'Google/Chrome/Application/chrome.exe'),
+        resolve(local, 'Google/Chrome/Application/chrome.exe'),
+      ];
+  return candidates.find(p => existsSync(p)) || null;
+}
+
+async function fetchDebuggerWsUrlFromPort(port, host = '127.0.0.1') {
+  try {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), 1500);
+    const res = await fetch(`http://${host}:${port}/json/version`, { signal: controller.signal });
+    clearTimeout(t);
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data.webSocketDebuggerUrl || null;
+  } catch {
+    return null;
+  }
+}
+
+async function ensureZeroPromptBrowserWsUrl(browser = 'chrome') {
+  const host = process.env.CDP_HOST || '127.0.0.1';
+  const port = DEFAULT_PORTS[browser] || 9224;
+
+  // 1. Check if browser CDP HTTP endpoint is already listening on its dedicated port
+  let wsUrl = await fetchDebuggerWsUrlFromPort(port, host);
+  if (wsUrl) return wsUrl;
+
+  // 2. On Windows, auto-launch the browser with its dedicated CDP profile so no "Allow" prompt ever fires
+  const exe = findBrowserExecutable(browser);
+  if (exe) {
+    const baseLocal = process.env.LOCALAPPDATA || resolve(homedir(), 'AppData', 'Local');
+    const profileDir = browser === 'edge'
+      ? resolve(baseLocal, 'Microsoft/Edge/CDP-Profile')
+      : resolve(baseLocal, 'Google/Chrome/CDP-Profile');
+    try { mkdirSync(profileDir, { recursive: true }); } catch {}
+
+    spawnDetached(exe, [
+      `--remote-debugging-port=${port}`,
+      `--user-data-dir=${profileDir}`,
+      '--no-first-run',
+      '--no-default-browser-check',
+      'about:blank',
+    ]);
+
+    for (let i = 0; i < 25; i++) {
+      await sleep(300);
+      wsUrl = await fetchDebuggerWsUrlFromPort(port, host);
+      if (wsUrl) return wsUrl;
+    }
+  }
+  return null;
+}
+
+function getDefaultProfileWsUrl(browser = 'chrome') {
   const home = homedir();
-  // macOS: ~/Library/Application Support/<name>/DevToolsActivePort
-  const macBrowsers = [
-    'Google/Chrome', 'Google/Chrome Beta', 'Google/Chrome for Testing',
-    'Chromium', 'BraveSoftware/Brave-Browser', 'Microsoft Edge',
-  ];
-  // Linux: ~/.config/<name>/DevToolsActivePort
-  const linuxBrowsers = [
-    'google-chrome', 'google-chrome-beta', 'chromium',
-    'vivaldi', 'vivaldi-snapshot',
-    'BraveSoftware/Brave-Browser', 'microsoft-edge',
-  ];
+  const baseLocal = process.env.LOCALAPPDATA || resolve(home, 'AppData/Local');
+
+  const browserMapWin = {
+    chrome: ['Google/Chrome', 'Google/Chrome Beta', 'Google/Chrome for Testing', 'Chromium'],
+    edge: ['Microsoft/Edge', 'Microsoft/Edge Beta', 'Microsoft/Edge Dev'],
+    brave: ['BraveSoftware/Brave-Browser'],
+  };
+  const browserMapMac = {
+    chrome: [
+      'Google/Chrome', 'Google/Chrome Beta', 'Google/Chrome for Testing',
+      'Chromium', 'Helium', 'Thorium', 'Vivaldi',
+      'BraveSoftware/Brave-Browser', 'Microsoft Edge',
+    ],
+    edge: ['Microsoft Edge', 'Microsoft Edge Beta', 'Microsoft Edge Dev'],
+    brave: ['BraveSoftware/Brave-Browser'],
+  };
+  const browserMapLinux = {
+    chrome: [
+      'google-chrome', 'google-chrome-beta', 'google-chrome-unstable',
+      'chromium', 'helium', 'thorium', 'vivaldi', 'vivaldi-snapshot',
+      'BraveSoftware/Brave-Browser', 'microsoft-edge',
+    ],
+    edge: ['microsoft-edge', 'microsoft-edge-beta', 'microsoft-edge-dev'],
+    brave: ['BraveSoftware/Brave-Browser'],
+  };
   // Linux Flatpak: ~/.var/app/<app-id>/config/<name>/DevToolsActivePort
   const flatpakBrowsers = [
     ['org.chromium.Chromium', 'chromium'],
@@ -56,13 +203,23 @@ function getWsUrl() {
     ['com.microsoft.Edge', 'microsoft-edge'],
     ['com.vivaldi.Vivaldi', 'vivaldi'],
   ];
+
+  const winDirs = browserMapWin[browser] || browserMapWin.chrome;
+  const macDirs = browserMapMac[browser] || browserMapMac.chrome;
+  const linuxDirs = browserMapLinux[browser] || browserMapLinux.chrome;
+
   const candidates = [
     process.env.CDP_PORT_FILE,
-    ...macBrowsers.flatMap(b => [
+    ...(IS_WINDOWS ? winDirs.flatMap(b => [
+      resolve(baseLocal, b, 'CDP-Profile/DevToolsActivePort'),
+      resolve(baseLocal, b, 'User Data/DevToolsActivePort'),
+      resolve(baseLocal, b, 'User Data/Default/DevToolsActivePort'),
+    ]) : []),
+    ...macDirs.flatMap(b => [
       resolve(home, 'Library/Application Support', b, 'DevToolsActivePort'),
       resolve(home, 'Library/Application Support', b, 'Default/DevToolsActivePort'),
     ]),
-    ...linuxBrowsers.flatMap(b => [
+    ...linuxDirs.flatMap(b => [
       resolve(home, '.config', b, 'DevToolsActivePort'),
       resolve(home, '.config', b, 'Default/DevToolsActivePort'),
     ]),
@@ -70,25 +227,26 @@ function getWsUrl() {
       resolve(home, '.var/app', appId, 'config', name, 'DevToolsActivePort'),
       resolve(home, '.var/app', appId, 'config', name, 'Default/DevToolsActivePort'),
     ]),
-    // Windows: %LOCALAPPDATA%/<name>/User Data/DevToolsActivePort
-    ...(IS_WINDOWS ? ['Google/Chrome', 'BraveSoftware/Brave-Browser', 'Microsoft/Edge'].flatMap(b => {
-      const base = process.env.LOCALAPPDATA || resolve(home, 'AppData/Local');
-      return [
-        resolve(base, b, 'User Data/DevToolsActivePort'),
-        resolve(base, b, 'User Data/Default/DevToolsActivePort'),
-      ];
-    }) : []),
   ].filter(Boolean);
+
   const portFile = candidates.find(p => existsSync(p));
-  if (!portFile) throw new Error('No DevToolsActivePort found. Enable remote debugging at chrome://inspect/#remote-debugging');
-  const lines = readFileSync(portFile, 'utf8').trim().split('\n');
+  if (!portFile) {
+    const inspectUrl = browser === 'edge' ? 'edge://inspect/#remote-debugging' : 'chrome://inspect/#remote-debugging';
+    throw new Error(`No DevToolsActivePort found for ${browser}. Enable remote debugging at ${inspectUrl}`);
+  }
+  const lines = readFileSync(portFile, 'utf8').trim().split(/\r?\n/);
   if (lines.length < 2 || !lines[0] || !lines[1]) throw new Error(`Invalid DevToolsActivePort file: ${portFile}`);
   const host = process.env.CDP_HOST || '127.0.0.1';
-  return `ws://${host}:${lines[0]}${lines[1]}`;
+  return `ws://${host}:${lines[0].trim()}${lines[1].trim()}`;
 }
 
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
+async function resolveWsUrl(browser = 'chrome', useDefaultProfile = false) {
+  if (IS_WINDOWS && !useDefaultProfile && !process.env.CDP_PORT_FILE) {
+    const zeroPromptUrl = await ensureZeroPromptBrowserWsUrl(browser);
+    if (zeroPromptUrl) return zeroPromptUrl;
+  }
+  return getDefaultProfileWsUrl(browser);
+}
 
 function resolvePrefix(prefix, candidates, noun = 'target', missingHint = '') {
   const upper = prefix.toUpperCase();
@@ -122,10 +280,21 @@ class CDP {
 
   async connect(wsUrl) {
     return new Promise((res, rej) => {
+      const timer = setTimeout(() => {
+        try { this.#ws?.close(); } catch {}
+        rej(new Error('WebSocket connect timeout (waiting for Allow debugging approval)'));
+      }, CONNECT_TIMEOUT);
       this.#ws = new WebSocket(wsUrl);
-      this.#ws.onopen = () => res();
-      this.#ws.onerror = (e) => rej(new Error('WebSocket error: ' + (e.message || e.type)));
-      this.#ws.onclose = () => this.#closeHandlers.forEach(h => h());
+      this.#ws.onopen = () => { clearTimeout(timer); res(); };
+      this.#ws.onerror = (e) => { clearTimeout(timer); rej(new Error('WebSocket error: ' + (e.message || e.type))); };
+      this.#ws.onclose = () => {
+        clearTimeout(timer);
+        for (const [, { reject }] of this.#pending) {
+          reject(new Error('CDP WebSocket closed'));
+        }
+        this.#pending.clear();
+        this.#closeHandlers.forEach(h => h());
+      };
       this.#ws.onmessage = (ev) => {
         const msg = JSON.parse(ev.data);
         if (msg.id && this.#pending.has(msg.id)) {
@@ -142,7 +311,7 @@ class CDP {
     });
   }
 
-  send(method, params = {}, sessionId) {
+  send(method, params = {}, sessionId, timeoutMs = TIMEOUT) {
     const id = ++this.#id;
     return new Promise((resolve, reject) => {
       this.#pending.set(id, { resolve, reject });
@@ -154,7 +323,7 @@ class CDP {
           this.#pending.delete(id);
           reject(new Error(`Timeout: ${method}`));
         }
-      }, TIMEOUT);
+      }, timeoutMs);
     });
   }
 
@@ -199,23 +368,38 @@ class CDP {
   }
 
   onClose(handler) { this.#closeHandlers.push(handler); }
-  close() { this.#ws.close(); }
+  close() { try { this.#ws?.close(); } catch {} }
 }
 
 // ---------------------------------------------------------------------------
 // Command implementations — return strings, take (cdp, sessionId)
 // ---------------------------------------------------------------------------
 
-async function getPages(cdp) {
+function isInternalUrl(url = '') {
+  return (
+    url.startsWith('chrome://') ||
+    url.startsWith('edge://') ||
+    url.startsWith('devtools://') ||
+    url.startsWith('chrome-extension://') ||
+    url.startsWith('extension://')
+  );
+}
+
+async function getPages(cdp, browser = 'chrome') {
   const { targetInfos } = await cdp.send('Target.getTargets');
-  return targetInfos.filter(t => t.type === 'page' && !t.url.startsWith('chrome://'));
+  const pages = targetInfos.filter(t => t.type === 'page' && !isInternalUrl(t.url));
+  try {
+    writeFileSync(pagesCachePath(browser), JSON.stringify(pages), { mode: 0o600 });
+    writeFileSync(LEGACY_PAGES_CACHE, JSON.stringify(pages), { mode: 0o600 });
+  } catch {}
+  return pages;
 }
 
 function formatPageList(pages) {
   const prefixLen = getDisplayPrefixLength(pages.map(p => p.targetId));
   return pages.map(p => {
     const id = p.targetId.slice(0, prefixLen).padEnd(prefixLen);
-    const title = p.title.substring(0, 54).padEnd(54);
+    const title = (p.title || '').substring(0, 54).padEnd(54);
     return `${id}  ${title}  ${p.url}`;
   }).join('\n');
 }
@@ -299,7 +483,6 @@ async function evalStr(cdp, sid, expression) {
 }
 
 async function shotStr(cdp, sid, filePath, targetId) {
-  // Get device scale factor so we can report coordinate mapping
   let dpr = 1;
   try {
     const metrics = await cdp.send('Page.getLayoutMetrics', {}, sid);
@@ -308,11 +491,9 @@ async function shotStr(cdp, sid, filePath, targetId) {
         ? Math.round((metrics.visualViewport.clientWidth / metrics.cssVisualViewport.clientWidth) * 100) / 100
         : 1
       : 1;
-    // Simpler: deviceScaleFactor is on the root Page metrics
     const { deviceScaleFactor } = await cdp.send('Emulation.getDeviceMetricsOverride', {}, sid).catch(() => ({}));
     if (deviceScaleFactor) dpr = deviceScaleFactor;
   } catch {}
-  // Fallback: try to get DPR from JS
   if (dpr === 1) {
     try {
       const raw = await evalStr(cdp, sid, 'window.devicePixelRatio');
@@ -402,7 +583,6 @@ async function netStr(cdp, sid) {
   ).join('\n');
 }
 
-// Click element by CSS selector
 async function clickStr(cdp, sid, selector) {
   if (!selector) throw new Error('CSS selector required');
   const expr = `
@@ -420,7 +600,6 @@ async function clickStr(cdp, sid, selector) {
   return `Clicked <${r.tag}> "${r.text}"`;
 }
 
-// Click at CSS pixel coordinates using Input.dispatchMouseEvent
 async function clickXyStr(cdp, sid, x, y) {
   const cx = parseFloat(x);
   const cy = parseFloat(y);
@@ -433,18 +612,16 @@ async function clickXyStr(cdp, sid, x, y) {
   return `Clicked at CSS (${cx}, ${cy})`;
 }
 
-// Type text using Input.insertText (works in cross-origin iframes, unlike eval)
 async function typeStr(cdp, sid, text) {
   if (text == null || text === '') throw new Error('text required');
   await cdp.send('Input.insertText', { text }, sid);
   return `Typed ${text.length} characters`;
 }
 
-// Load-more: repeatedly click a button/selector until it disappears
 async function loadAllStr(cdp, sid, selector, intervalMs = 1500) {
   if (!selector) throw new Error('CSS selector required');
   let clicks = 0;
-  const deadline = Date.now() + 5 * 60 * 1000; // 5-minute hard cap
+  const deadline = Date.now() + 5 * 60 * 1000;
   while (Date.now() < deadline) {
     const exists = await evalStr(cdp, sid,
       `!!document.querySelector(${JSON.stringify(selector)})`
@@ -467,7 +644,6 @@ async function loadAllStr(cdp, sid, selector, intervalMs = 1500) {
   return `Clicked "${selector}" ${clicks} time(s) until it disappeared`;
 }
 
-// Send a raw CDP command and return the result as JSON
 async function evalRawStr(cdp, sid, method, paramsJson) {
   if (!method) throw new Error('CDP method required (e.g. "DOM.getDocument")');
   let params = {};
@@ -480,88 +656,161 @@ async function evalRawStr(cdp, sid, method, paramsJson) {
 }
 
 // ---------------------------------------------------------------------------
-// Per-tab daemon
+// Persistent Browser Multiplexer Daemon (1 WebSocket per Browser)
 // ---------------------------------------------------------------------------
 
-async function runDaemon(targetId) {
-  const sp = sockPath(targetId);
+async function runBrowserDaemon(browser = 'chrome', useDefaultProfile = false) {
+  const sp = browserSockPath(browser);
 
   const cdp = new CDP();
   try {
-    await cdp.connect(getWsUrl());
+    const wsUrl = await resolveWsUrl(browser, useDefaultProfile);
+    await cdp.connect(wsUrl);
+    await getPages(cdp, browser);
   } catch (e) {
-    process.stderr.write(`Daemon: cannot connect to Chrome: ${e.message}\n`);
+    process.stderr.write(`Daemon (${browser}): cannot connect: ${e.message}\n`);
     process.exit(1);
   }
 
-  let sessionId;
-  try {
+  const sessions = new Map();
+
+  async function getOrAttachSession(targetId) {
+    if (sessions.has(targetId)) {
+      return sessions.get(targetId);
+    }
     const res = await cdp.send('Target.attachToTarget', { targetId, flatten: true });
-    sessionId = res.sessionId;
-  } catch (e) {
-    process.stderr.write(`Daemon: attach failed: ${e.message}\n`);
-    cdp.close();
-    process.exit(1);
+    sessions.set(targetId, res.sessionId);
+    return res.sessionId;
   }
 
-  // Shutdown helpers
+  async function resolveTargetId(targetPrefix) {
+    let pages = [];
+    const cacheFile = pagesCachePath(browser);
+    if (existsSync(cacheFile)) {
+      try { pages = JSON.parse(readFileSync(cacheFile, 'utf8')); } catch {}
+    }
+    try {
+      return resolvePrefix(targetPrefix, pages.map(p => p.targetId), 'target');
+    } catch {
+      pages = await getPages(cdp, browser);
+      return resolvePrefix(targetPrefix, pages.map(p => p.targetId), 'target', 'Run "cdp list".');
+    }
+  }
+
   let alive = true;
   function shutdown() {
     if (!alive) return;
     alive = false;
-    server.close();
+    clearInterval(keepaliveTimer);
+    clearTimeout(idleTimer);
+    try { server.close(); } catch {}
     if (!IS_WINDOWS) try { unlinkSync(sp); } catch {}
     cdp.close();
     process.exit(0);
   }
 
-  // Exit if target goes away or Chrome disconnects
   cdp.onEvent('Target.targetDestroyed', (params) => {
-    if (params.targetId === targetId) shutdown();
+    if (params.targetId) sessions.delete(params.targetId);
   });
   cdp.onEvent('Target.detachedFromTarget', (params) => {
-    if (params.sessionId === sessionId) shutdown();
+    if (params.targetId) {
+      sessions.delete(params.targetId);
+    } else if (params.sessionId) {
+      for (const [tid, sid] of sessions.entries()) {
+        if (sid === params.sessionId) sessions.delete(tid);
+      }
+    }
   });
+
   cdp.onClose(() => shutdown());
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
 
-  // Idle timer
   let idleTimer = setTimeout(shutdown, IDLE_TIMEOUT);
   function resetIdle() {
     clearTimeout(idleTimer);
     idleTimer = setTimeout(shutdown, IDLE_TIMEOUT);
   }
+  const keepaliveTimer = setInterval(async () => {
+    try {
+      await cdp.send('Browser.getVersion', {}, undefined, 5000);
+    } catch {}
+  }, KEEPALIVE_INTERVAL);
 
-  // Handle a command
-  async function handleCommand({ cmd, args }) {
+  async function handleCommand({ cmd, targetPrefix, args = [] }) {
     resetIdle();
     try {
-      let result;
       switch (cmd) {
         case 'list': {
-          const pages = await getPages(cdp);
-          result = formatPageList(pages);
-          break;
+          const pages = await getPages(cdp, browser);
+          return { ok: true, result: formatPageList(pages) };
         }
         case 'list_raw': {
-          const pages = await getPages(cdp);
-          result = JSON.stringify(pages);
-          break;
+          const pages = await getPages(cdp, browser);
+          return { ok: true, result: JSON.stringify(pages) };
         }
-        case 'snap': case 'snapshot': result = await snapshotStr(cdp, sessionId, true); break;
-        case 'eval': result = await evalStr(cdp, sessionId, args[0]); break;
-        case 'shot': case 'screenshot': result = await shotStr(cdp, sessionId, args[0], targetId); break;
-        case 'html': result = await htmlStr(cdp, sessionId, args[0]); break;
-        case 'nav': case 'navigate': result = await navStr(cdp, sessionId, args[0]); break;
-        case 'net': case 'network': result = await netStr(cdp, sessionId); break;
-        case 'click': result = await clickStr(cdp, sessionId, args[0]); break;
-        case 'clickxy': result = await clickXyStr(cdp, sessionId, args[0], args[1]); break;
-        case 'type': result = await typeStr(cdp, sessionId, args[0]); break;
-        case 'loadall': result = await loadAllStr(cdp, sessionId, args[0], args[1] ? parseInt(args[1]) : 1500); break;
-        case 'evalraw': result = await evalRawStr(cdp, sessionId, args[0], args[1]); break;
-        case 'stop': return { ok: true, result: '', stopAfter: true };
-        default: return { ok: false, error: `Unknown command: ${cmd}` };
+        case 'open': {
+          const url = args[0] || 'about:blank';
+          const { targetId } = await cdp.send('Target.createTarget', { url });
+          try { await getOrAttachSession(targetId); } catch {}
+          const pages = await getPages(cdp, browser);
+          if (!pages.some(p => p.targetId === targetId)) {
+            pages.push({ targetId, title: url, url });
+            try {
+              writeFileSync(pagesCachePath(browser), JSON.stringify(pages), { mode: 0o600 });
+              writeFileSync(LEGACY_PAGES_CACHE, JSON.stringify(pages), { mode: 0o600 });
+            } catch {}
+          }
+          return { ok: true, result: `Opened new tab: ${targetId.slice(0, 8)}  ${url}` };
+        }
+        case 'stop': {
+          if (targetPrefix) {
+            const tid = await resolveTargetId(targetPrefix).catch(() => null);
+            if (tid && sessions.has(tid)) {
+              const sid = sessions.get(tid);
+              sessions.delete(tid);
+              await cdp.send('Target.detachFromTarget', { sessionId: sid }).catch(() => {});
+            }
+            return { ok: true, result: '' };
+          }
+          return { ok: true, result: '', stopAfter: true };
+        }
+      }
+
+      if (!targetPrefix) {
+        return { ok: false, error: 'Target ID required. Run "cdp list" first.' };
+      }
+      const targetId = await resolveTargetId(targetPrefix);
+      let sessionId = await getOrAttachSession(targetId);
+
+      async function runPageOp(sid) {
+        switch (cmd) {
+          case 'snap': case 'snapshot': return await snapshotStr(cdp, sid, true);
+          case 'eval': return await evalStr(cdp, sid, args[0]);
+          case 'shot': case 'screenshot': return await shotStr(cdp, sid, args[0], targetId);
+          case 'html': return await htmlStr(cdp, sid, args[0]);
+          case 'nav': case 'navigate': return await navStr(cdp, sid, args[0]);
+          case 'net': case 'network': return await netStr(cdp, sid);
+          case 'click': return await clickStr(cdp, sid, args[0]);
+          case 'clickxy': return await clickXyStr(cdp, sid, args[0], args[1]);
+          case 'type': return await typeStr(cdp, sid, args[0]);
+          case 'loadall': return await loadAllStr(cdp, sid, args[0], args[1] ? parseInt(args[1]) : 1500);
+          case 'evalraw': return await evalRawStr(cdp, sid, args[0], args[1]);
+          default: throw new Error(`Unknown command: ${cmd}`);
+        }
+      }
+
+      let result;
+      try {
+        result = await runPageOp(sessionId);
+      } catch (err) {
+        if (/Session with given id not found|Target closed|detached/i.test(err.message)) {
+          sessions.delete(targetId);
+          sessionId = await getOrAttachSession(targetId);
+          result = await runPageOp(sessionId);
+        } else {
+          throw err;
+        }
       }
       return { ok: true, result: result ?? '' };
     } catch (e) {
@@ -569,17 +818,13 @@ async function runDaemon(targetId) {
     }
   }
 
-  // Unix socket server — NDJSON protocol
-  // Wire format: each message is one JSON object followed by \n (newline-delimited JSON).
-  // Request:  { "id": <number>, "cmd": "<command>", "args": ["arg1", "arg2", ...] }
-  // Response: { "id": <number>, "ok": <boolean>, "result": "<string>" }
-  //           or { "id": <number>, "ok": false, "error": "<message>" }
   const server = net.createServer((conn) => {
+    conn.on('error', () => {});
     let buf = '';
     conn.on('data', (chunk) => {
       buf += chunk.toString();
       const lines = buf.split('\n');
-      buf = lines.pop(); // keep incomplete last line
+      buf = lines.pop();
       for (const line of lines) {
         if (!line.trim()) continue;
         let req;
@@ -619,27 +864,37 @@ function connectToSocket(sp) {
   });
 }
 
-async function getOrStartTabDaemon(targetId) {
-  const sp = sockPath(targetId);
-  // Try existing daemon
+async function getOrStartBrowserDaemon(browser = 'chrome', useDefaultProfile = false) {
+  const sp = browserSockPath(browser);
+  // 1. Reuse existing persistent browser daemon if running
   try { return await connectToSocket(sp); } catch {}
 
-  // Clean stale socket
+  // 2. Ensure target browser CDP endpoint is ready (auto-launches zero-prompt CDP profile if needed)
+  await resolveWsUrl(browser, useDefaultProfile);
+
   if (!IS_WINDOWS) try { unlinkSync(sp); } catch {}
 
-  // Spawn daemon
-  const child = spawn(process.execPath, [process.argv[1], '_daemon', targetId], {
-    detached: true,
-    stdio: 'ignore',
+  // 3. Spawn persistent browser daemon outside parent Job Object
+  const daemonArgs = [process.argv[1], '_daemon', `--browser=${browser}`];
+  if (useDefaultProfile) daemonArgs.push('--default-profile');
+  spawnDetached(process.execPath, daemonArgs, {
+    ...process.env,
+    CDP_BROWSER: browser,
+    ...(useDefaultProfile ? { CDP_DEFAULT_PROFILE: '1' } : {}),
   });
-  child.unref();
 
-  // Wait for socket (includes time for user to click Allow)
+  let prompted = false;
   for (let i = 0; i < DAEMON_CONNECT_RETRIES; i++) {
     await sleep(DAEMON_CONNECT_DELAY);
     try { return await connectToSocket(sp); } catch {}
+    if (i === 8 && !prompted && useDefaultProfile) {
+      prompted = true;
+      const bName = browser === 'edge' ? 'Microsoft Edge' : 'Google Chrome';
+      process.stderr.write(`Waiting for one-time "Allow debugging?" approval in ${bName}...\n`);
+    }
   }
-  throw new Error('Daemon failed to start — did you click Allow in Chrome?');
+  const bName = browser === 'edge' ? 'Microsoft Edge' : 'Google Chrome';
+  throw new Error(`Daemon failed to start for ${bName}.`);
 }
 
 function sendCommand(conn, req) {
@@ -695,34 +950,12 @@ function sendCommand(conn, req) {
 }
 
 // ---------------------------------------------------------------------------
-// Stop daemons
-// ---------------------------------------------------------------------------
-
-async function stopDaemons(targetPrefix) {
-  if (!existsSync(PAGES_CACHE)) return;
-  const pages = JSON.parse(readFileSync(PAGES_CACHE, 'utf8'));
-  const targets = targetPrefix
-    ? [resolvePrefix(targetPrefix, pages.map(p => p.targetId), 'target')]
-    : pages.map(p => p.targetId);
-
-  for (const targetId of targets) {
-    const sp = sockPath(targetId);
-    try {
-      const conn = await connectToSocket(sp);
-      await sendCommand(conn, { cmd: 'stop' });
-    } catch {
-      if (!IS_WINDOWS) try { unlinkSync(sp); } catch {}
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
-const USAGE = `cdp - lightweight Chrome DevTools Protocol CLI (no Puppeteer)
+const USAGE = `cdp - lightweight Chrome & Edge DevTools Protocol CLI (no Puppeteer)
 
-Usage: cdp <command> [args]
+Usage: cdp [--browser chrome|edge] <command> [args]
 
   list                              List open pages (shows unique target prefixes)
   snap  <target>                    Accessibility tree snapshot
@@ -732,46 +965,16 @@ Usage: cdp <command> [args]
   nav   <target> <url>              Navigate to URL and wait for load completion
   net   <target>                    Network performance entries
   click   <target> <selector>       Click an element by CSS selector
-  clickxy <target> <x> <y>          Click at CSS pixel coordinates (see coordinate note below)
+  clickxy <target> <x> <y>          Click at CSS pixel coordinates
   type    <target> <text>           Type text at current focus via Input.insertText
-                                    Works in cross-origin iframes unlike eval-based approaches
   loadall <target> <selector> [ms]  Repeatedly click a "load more" button until it disappears
-                                    Optional interval in ms between clicks (default 1500)
   evalraw <target> <method> [json]  Send a raw CDP command; returns JSON result
-                                    e.g. evalraw <t> "DOM.getDocument" '{}'
-  open  [url]                       Open a new tab (default: about:blank)
-                                    Note: each new tab triggers a fresh "Allow debugging?" prompt
-  stop  [target]                    Stop daemon(s)
+  open  [url]                       Open a new tab (zero-prompt persistent session)
+  stop  [target]                    Stop daemon (or detach a single target)
 
-<target> is a unique targetId prefix from "cdp list". If a prefix is ambiguous,
-use more characters.
-
-COORDINATE SYSTEM
-  shot captures the viewport at the device's native resolution.
-  The screenshot image size = CSS pixels × DPR (device pixel ratio).
-  For CDP Input events (clickxy, etc.) you need CSS pixels, not image pixels.
-
-    CSS pixels = screenshot image pixels / DPR
-
-  shot prints the DPR and an example conversion for the current page.
-  Typical Retina (DPR=2): CSS px ≈ screenshot px × 0.5
-  If your viewer rescales the image further, account for that scaling too.
-
-EVAL SAFETY NOTE
-  Avoid index-based DOM selection (querySelectorAll(...)[i]) across multiple
-  eval calls when the list can change between calls (e.g. after clicking
-  "Ignore" buttons on a feed — indices shift). Prefer stable selectors or
-  collect all data in a single eval.
-
-DAEMON IPC (for advanced use / scripting)
-  Each tab runs a persistent daemon at Unix socket in the runtime dir (see below).
-  Protocol: newline-delimited JSON (one JSON object per line, UTF-8).
-    Request:  {"id":<number>, "cmd":"<command>", "args":["arg1","arg2",...]}
-    Response: {"id":<number>, "ok":true,  "result":"<string>"}
-           or {"id":<number>, "ok":false, "error":"<message>"}
-  Commands mirror the CLI: snap, eval, shot, html, nav, net, click, clickxy,
-  type, loadall, evalraw, stop. Use evalraw to send arbitrary CDP methods.
-  The socket disappears after 20 min of inactivity or when the tab closes.
+Options:
+  --browser, -b <chrome|edge>       Target browser (default: chrome, or CDP_BROWSER env var)
+  --default-profile                 Use default profile DevToolsActivePort instead of zero-prompt CDP profile
 `;
 
 const NEEDS_TARGET = new Set([
@@ -780,51 +983,52 @@ const NEEDS_TARGET = new Set([
 ]);
 
 async function main() {
-  const [cmd, ...args] = process.argv.slice(2);
+  const { browser, useDefaultProfile, args: rawArgs } = detectBrowserFromArgs(process.argv.slice(2));
+  const [cmd, ...args] = rawArgs;
 
   // Daemon mode (internal)
-  if (cmd === '_daemon') { await runDaemon(args[0]); return; }
+  if (cmd === '_daemon') { await runBrowserDaemon(args[0] || browser, useDefaultProfile); return; }
 
   if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') {
     console.log(USAGE); process.exit(0);
   }
 
   if (cmd === 'list' || cmd === 'ls') {
-    const cdp = new CDP();
-    await cdp.connect(getWsUrl());
-    const pages = await getPages(cdp);
-    cdp.close();
-    writeFileSync(PAGES_CACHE, JSON.stringify(pages), { mode: 0o600 });
-    console.log(formatPageList(pages));
-    setTimeout(() => process.exit(0), 100);
+    const conn = await getOrStartBrowserDaemon(browser, useDefaultProfile);
+    const response = await sendCommand(conn, { cmd: 'list' });
+    if (response.ok) {
+      if (response.result) console.log(response.result);
+    } else {
+      console.error('Error:', response.error);
+      process.exitCode = 1;
+    }
     return;
   }
 
-  // Open new tab
   if (cmd === 'open') {
     const url = args[0] || 'about:blank';
-    const cdp = new CDP();
-    await cdp.connect(getWsUrl());
-    const { targetId } = await cdp.send('Target.createTarget', { url });
-    // Refresh cache; new tab may not appear in getTargets immediately, so add it manually
-    const pages = await getPages(cdp);
-    if (!pages.some(p => p.targetId === targetId)) {
-      pages.push({ targetId, title: url, url });
+    const conn = await getOrStartBrowserDaemon(browser, useDefaultProfile);
+    const response = await sendCommand(conn, { cmd: 'open', args: [url] });
+    if (response.ok) {
+      if (response.result) console.log(response.result);
+    } else {
+      console.error('Error:', response.error);
+      process.exitCode = 1;
     }
-    cdp.close();
-    writeFileSync(PAGES_CACHE, JSON.stringify(pages), { mode: 0o600 });
-    console.log(`Opened new tab: ${targetId.slice(0, 8)}  ${url}`);
-    console.log('Note: this tab will need "Allow debugging?" approval on first access.');
     return;
   }
 
-  // Stop
   if (cmd === 'stop') {
-    await stopDaemons(args[0]);
+    const sp = browserSockPath(browser);
+    try {
+      const conn = await connectToSocket(sp);
+      await sendCommand(conn, { cmd: 'stop', targetPrefix: args[0] });
+    } catch {
+      if (!IS_WINDOWS) try { unlinkSync(sp); } catch {}
+    }
     return;
   }
 
-  // Page commands — need target prefix
   if (!NEEDS_TARGET.has(cmd)) {
     console.error(`Unknown command: ${cmd}\n`);
     console.log(USAGE);
@@ -837,16 +1041,6 @@ async function main() {
     process.exit(1);
   }
 
-  // Resolve prefix → full targetId from pages cache
-  if (!existsSync(PAGES_CACHE)) {
-    console.error('No page list cached. Run "cdp list" first.');
-    process.exit(1);
-  }
-  const pages = JSON.parse(readFileSync(PAGES_CACHE, 'utf8'));
-  const targetId = resolvePrefix(targetPrefix, pages.map(p => p.targetId), 'target', 'Run "cdp list".');
-
-  const conn = await getOrStartTabDaemon(targetId);
-
   const cmdArgs = args.slice(1);
 
   if (cmd === 'eval') {
@@ -854,12 +1048,10 @@ async function main() {
     if (!expr) { console.error('Error: expression required'); process.exit(1); }
     cmdArgs[0] = expr;
   } else if (cmd === 'type') {
-    // Join all remaining args as text (allows spaces)
     const text = cmdArgs.join(' ');
     if (!text) { console.error('Error: text required'); process.exit(1); }
     cmdArgs[0] = text;
   } else if (cmd === 'evalraw') {
-    // args: [method, ...jsonParts] — join json parts in case of spaces
     if (!cmdArgs[0]) { console.error('Error: CDP method required'); process.exit(1); }
     if (cmdArgs.length > 2) cmdArgs[1] = cmdArgs.slice(1).join(' ');
   }
@@ -869,7 +1061,8 @@ async function main() {
     process.exit(1);
   }
 
-  const response = await sendCommand(conn, { cmd, args: cmdArgs });
+  const conn = await getOrStartBrowserDaemon(browser, useDefaultProfile);
+  const response = await sendCommand(conn, { cmd, targetPrefix, args: cmdArgs });
 
   if (response.ok) {
     if (response.result) console.log(response.result);
